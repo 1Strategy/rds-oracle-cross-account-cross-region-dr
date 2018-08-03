@@ -1,0 +1,136 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Set up cross-account and cross-region DR solution for RDS.'
+
+Parameters:
+  DRRegion:
+    Type: String
+    Description: The DR region to copy the backups of RDS snapshots.
+    Default: us-east-2
+  MaxSnapshotRetention:
+    Type: Number
+    Description: Max screenshot retention number.
+    Default: 3
+
+Resources:
+  RDSBackupExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AmazonRDSFullAccess
+      - arn:aws:iam::aws:policy/service-role/AmazonSNSRole
+      - arn:aws:iam::aws:policy/AmazonSNSFullAccess
+
+  RDSCopySnapshot: 
+    Type: AWS::Lambda::Function
+    Properties: 
+      Code:
+        ZipFile: |
+            import boto3
+            import botocore
+            import logging
+            import os
+
+            LOGGER = logging.getLogger()
+            LOGGER.setLevel(logging.INFO)
+
+            def is_tag_matching(tag_list, tag_to_match):
+                # for tag pair like { 'Key': 'key', 'Value': 'Value'}
+                for tag_pair in tag_list:
+                    if tag_pair == tag_to_match:
+                        return True
+                return False
+
+            def get_all_snapshots(db_instance_id, rds_client, pagination_marker='', max_records=100):
+                response = rds_client.describe_db_snapshots(DBInstanceIdentifier=db_instance_id, SnapshotType='manual', Marker=pagination_marker, MaxRecords=max_records)
+                snapshots = response['DBSnapshots']
+                if ('Marker' in response) and (len(response['Marker']) > 0):
+                    return snapshots + get_all_snapshots(db_instance_id, rds_client, pagination_marker=response['Marker'], max_records=max_records)
+                else:
+                    return snapshots
+
+            def cleanup_snapshots(db_instance_id, tag_to_match, expected_snapshot_number, region_name):
+                rds_client_source = boto3.client('rds', region_name=region_name)
+                snapshots_raw = get_all_snapshots(db_instance_id, rds_client_source)
+                snapshots = []
+                for s in snapshots_raw:
+                    if s['Status'] == 'available':
+                        snapshots.append(s)
+                if len(snapshots) <= expected_snapshot_number:
+                    print('No cleanup needed.')
+                    return
+                
+                # filter out non-dr snapshots
+                print('Cleaning up snapshots for db instance {}, expected snapshot to keep: {}.'.format(db_instance_id, expected_snapshot_number))
+                snapshots_dr = []
+                for snapshot in snapshots:
+                    if is_tag_matching(rds_client_source.list_tags_for_resource(ResourceName=snapshot['DBSnapshotArn'])['TagList'],tag_to_match):
+                        snapshots_dr.append(snapshot)
+                delete_count = len(snapshots_dr) - expected_snapshot_number
+                if delete_count > 0:
+                    sorted_dr_snapshots = sorted(
+                        snapshots_dr,
+                        key=lambda snapshot: snapshot['SnapshotCreateTime']
+                    )
+                    while delete_count > 0:
+                        snapshot_id = sorted_dr_snapshots[delete_count - 1]['DBSnapshotIdentifier']
+                        try:
+                            print('Removing snapshot {}'.format(snapshot_id))
+                            rds_client_source.delete_db_snapshot(DBSnapshotIdentifier=snapshot_id)
+                        except:
+                            print('Error removing snapshot {}'.format(snapshot_id))
+                        delete_count -= 1
+                print('Finish cleaning up snapshots for db instance {}'.format(db_instance_id))
+
+            def lambda_handler(event, context):
+                print(event)
+                source_snapshot_arn = event['Records'][0]['Sns']['Message']
+                source_snapshot_id = source_snapshot_arn.split(':')[-1]
+                target_region = os.environ['target_region']
+                max_retention = int(os.environ['max_retention'])
+
+                rds_client = boto3.client('rds', region_name=target_region)
+                rds_client.copy_db_snapshot(
+                    SourceDBSnapshotIdentifier=source_snapshot_arn,
+                    TargetDBSnapshotIdentifier='{}-cross-account'.format(source_snapshot_id),
+                    SourceRegion=target_region,
+                    Tags=[
+                        {
+                            'Key': 'dr',
+                            'Value': 'true'
+                        }
+                    ]
+                )
+
+                snapshot = rds_client.describe_db_snapshots(
+                    DBSnapshotIdentifier=source_snapshot_arn,
+                    SnapshotType='shared'
+                )
+
+                cleanup_snapshots(
+                    snapshot['DBSnapshots'][0]['DBInstanceIdentifier'],
+                    {'Key': 'dr', 'Value': 'true'},
+                    max_retention - 1,
+                    target_region
+                )
+      Handler: index.lambda_handler
+      Role: !GetAtt RDSBackupExecutionRole.Arn
+      Runtime: python3.6
+      Timeout: '60'
+      Environment:
+        Variables:
+          target_region: !Ref DRRegion
+          max_retention: !Ref MaxSnapshotRetention
+
+Outputs:
+  CopySnapshotLambdaArn:
+    Value: !GetAtt RDSCopySnapshot.Arn
+    Description: Copy Snapshot Lambda Arn
